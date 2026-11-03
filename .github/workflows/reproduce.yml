@@ -1,0 +1,311 @@
+# Reproducibility check: rebuilds the authors' computing environment as it was
+# when the materials were deposited, runs their code unchanged, and renders a
+# report with the console transcript, the figures and the session information.
+# Two optional jobs use metacheck: `inspect` reads the deposited files before
+# anything is run, and `compare` looks for the paper's reported tests in the
+# output. They are chosen with the checkboxes under "Run workflow"; on a push,
+# `inspect` runs and `compare` does not. The reproduction never depends on them.
+#
+# The three values a checker sets per manuscript (R version, CRAN snapshot,
+# entry script) are in settings.env at the root of the repository; this file
+# is not edited per manuscript. The code in manuscript/ is never edited: whatever it needs to run is a finding
+# for the checklist issue, not a fix.
+
+name: Reproduce
+
+on:
+  workflow_dispatch:
+    inputs:
+      inspect:
+        description: "Inspect the deposited files with metacheck"
+        type: boolean
+        default: true
+      compare:
+        description: "Compare reported and reproduced results with metacheck (needs paper/manuscript.pdf)"
+        type: boolean
+        default: false
+  # Only a change to settings.env starts a run, so the checker uploads the
+  # authors' files first and fills in the settings last; that commit starts
+  # the check. After the authors correct their deposit, the check is run again
+  # with "Run workflow".
+  push:
+    paths:
+      - "settings.env"
+
+env:
+  # The metacheck used by `inspect` and `compare`.
+  # metacheck is beta software that changes weekly, so the version is fixed
+  # by commit (0.4.1.13, 2026-10-29).
+  METACHECK_REF: "bf36918f6aef5ed55c820baeb8486e4ae56f9fe7"
+  # rocker/r-ver:4.6.0's own CRAN copy is frozen at 2026-06-23, too old for
+  # metacheck's dependencies (ellmer >= 0.4.2); packages come from the copy
+  # of the same day as the metacheck commit.
+  METACHECK_CRAN: "2026-10-29"
+
+jobs:
+  # Settings ####
+  # Reads settings.env, checks each value, and passes them to the jobs that
+  # use them; the container of `reproduce` is chosen from R_VERSION here, so
+  # the version is written in one place only. A malformed value stops the run
+  # with a message before anything is installed. While all three values are
+  # blank, as in a repository just made from the template, the run ends here
+  # with a notice and the other jobs are skipped.
+  settings:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.read.outputs.ready }}
+      r_version: ${{ steps.read.outputs.R_VERSION }}
+      cran_snapshot: ${{ steps.read.outputs.CRAN_SNAPSHOT }}
+      entry_script: ${{ steps.read.outputs.ENTRY_SCRIPT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read and check settings.env
+        id: read
+        run: |
+          get() { grep -E "^$1=" settings.env | tail -n 1 | cut -d= -f2- | sed 's/[[:space:]]*$//'; }
+          R_VERSION=$(get R_VERSION)
+          CRAN_SNAPSHOT=$(get CRAN_SNAPSHOT)
+          ENTRY_SCRIPT=$(get ENTRY_SCRIPT)
+          if [[ -z "$R_VERSION$CRAN_SNAPSHOT$ENTRY_SCRIPT" ]]; then
+            echo "::notice::settings.env is not filled in yet, so nothing was run."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ok=true
+          [[ "$R_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::R_VERSION '$R_VERSION' is not of the form 4.3.1"; ok=false; }
+          [[ "$CRAN_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not of the form 2023-10-07"; ok=false; }
+          [[ -f "manuscript/$ENTRY_SCRIPT" ]] \
+            || { echo "::error::ENTRY_SCRIPT '$ENTRY_SCRIPT' is not a file in manuscript/"; ok=false; }
+          $ok
+          {
+            echo "R_VERSION=$R_VERSION"
+            echo "CRAN_SNAPSHOT=$CRAN_SNAPSHOT"
+            echo "ENTRY_SCRIPT=$ENTRY_SCRIPT"
+            echo "ready=true"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Inspection ####
+  # metacheck reads the files in manuscript/ without running them: inventory,
+  # missing files, paths tied to the authors' computer, installation lines,
+  # data and codebook checks. It needs current R, so it runs in a job of its
+  # own, alongside `reproduce` and independent of it: if it fails, the
+  # reproduction still runs. It waits only for `settings`. Nothing is sent out: report_repository() follows
+  # no links and downloads nothing, and the language model is switched off.
+  inspect:
+    needs: settings
+    if: needs.settings.outputs.ready == 'true' && (github.event_name == 'push' || inputs.inspect)
+    runs-on: ubuntu-latest
+    container: rocker/r-ver:4.6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install metacheck
+        run: |
+          /rocker_scripts/install_quarto.sh
+          Rscript -e '
+            options(repos = c(CRAN = paste0("https://p3m.dev/cran/__linux__/noble/", Sys.getenv("METACHECK_CRAN"))))
+            install.packages("pak")
+            pak::pkg_install(paste0("scienceverse/metacheck@", Sys.getenv("METACHECK_REF")))
+          '
+
+      - name: Inspect the deposited files
+        run: |
+          mkdir -p inspection
+          Rscript -e '
+            library(metacheck)
+            llm_use(FALSE)
+            report_repository("manuscript",
+                              output_file = "inspection/inspection.html",
+                              report_type = "checklist")
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inspection-report
+          path: inspection/
+
+  reproduce:
+    needs: settings
+    if: needs.settings.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    container: rocker/r-ver:${{ needs.settings.outputs.r_version }}
+    env:
+      R_VERSION: ${{ needs.settings.outputs.r_version }}
+      CRAN_SNAPSHOT: ${{ needs.settings.outputs.cran_snapshot }}
+      ENTRY_SCRIPT: ${{ needs.settings.outputs.entry_script }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Environment ####
+      # Every R session in this job reads this profile: CRAN is pinned to the
+      # snapshot, and any figure the authors' code draws is written as a PNG
+      # into run/ instead of the default Rplots.pdf.
+      - name: Pin CRAN snapshot and figure device
+        run: |
+          mkdir -p run
+          # Ready-built packages must match the container's Ubuntu release
+          # (jammy for R 4.3 and earlier, noble from R 4.4), read from the system.
+          . /etc/os-release
+          cat > run/.Rprofile <<EOF
+          options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/${VERSION_CODENAME}/${CRAN_SNAPSHOT}"))
+          options(device = function(...) grDevices::png(
+            file.path("${GITHUB_WORKSPACE}", "run", "figure-%02d.png"),
+            width = 1600, height = 1200, res = 200))
+          EOF
+          echo "R_PROFILE_USER=${GITHUB_WORKSPACE}/run/.Rprofile" >> "$GITHUB_ENV"
+
+      # Dependencies ####
+      # Packages are read from library() and require() calls in the authors'
+      # scripts, in manuscript/ and its subfolders, and installed from the snapshot, so the versions are those the
+      # authors could have had.
+      - name: Install the packages the code loads
+        run: |
+          Rscript -e '
+            files <- list.files("manuscript", pattern = "[.][Rr]$", full.names = TRUE, recursive = TRUE)
+            code  <- unlist(lapply(files, readLines, warn = FALSE))
+            hits  <- regmatches(code, regexpr("(library|require)\\(([A-Za-z0-9.]+)", code))
+            pkgs  <- unique(sub(".*\\(", "", hits))
+            cat("Packages found:", pkgs, "\n")
+            if (length(pkgs) > 0) install.packages(pkgs)
+          '
+
+      # Run ####
+      # The code runs from a copy of manuscript/, so the deposited files stay
+      # untouched. R echoes every command, which gives a transcript a checker
+      # can read line by line. A failure is recorded, not fatal: the report is
+      # still produced.
+      - name: Run the authors' code
+        run: |
+          cp -R manuscript/. run/
+          cd run
+          set +e
+          R --no-save --no-restore < "${ENTRY_SCRIPT}" > transcript.txt 2>&1
+          echo $? > exit_status.txt
+          # R version, platform, and every package installed beyond base R.
+          Rscript -e 'print(sessionInfo()); ip <- installed.packages(priority = "NA"); print(ip[, c("Package", "Version")], quote = FALSE, row.names = FALSE)' > session_info.txt 2>&1
+          echo "Exit status: $(cat exit_status.txt)"
+
+      # Report ####
+      - name: Render the report
+        run: |
+          /rocker_scripts/install_quarto.sh
+          # Transcript and session information go into the report as code blocks.
+          for f in transcript session_info; do
+            { echo '```'; cat "run/$f.txt"; echo '```'; } > "report/_$f.md"
+          done
+          cp run/exit_status.txt report/
+          cp run/figure-*.png report/ 2>/dev/null || true
+          ls report/figure-*.png 2>/dev/null \
+            | sed 's#report/##; s#.*#![](&){width=80%}\n#' > report/_figures.md
+          cd report
+          quarto render report.qmd \
+            -M "r-version:${R_VERSION}" \
+            -M "cran-snapshot:${CRAN_SNAPSHOT}" \
+            -M "entry-script:${ENTRY_SCRIPT}" \
+            -M "exit-status:$(cat exit_status.txt)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reproducibility-report
+          path: |
+            report/report.html
+            run/
+
+  # Comparison ####
+  # metacheck reads the manuscript and looks for each statistical test it
+  # reports in the console output of the `reproduce` job. GROBID, which turns
+  # the PDF into text, runs as a container inside this job, so the manuscript
+  # is not sent out. metacheck recognises standard tests only (t, F,
+  # chi-square, correlations, regression tables); every other number in the
+  # paper is left to the checker, and the summary says so.
+  compare:
+    if: needs.settings.outputs.ready == 'true' && github.event_name == 'workflow_dispatch' && inputs.compare
+    needs: [settings, reproduce]
+    runs-on: ubuntu-latest
+    container: rocker/r-ver:4.6.0
+    env:
+      ENTRY_SCRIPT: ${{ needs.settings.outputs.entry_script }}
+    services:
+      # The light GROBID image (0.5 GB) of the version metacheck uses; the full
+      # image is 10 GB.
+      grobid:
+        image: grobid/grobid:0.9.0-crf
+    steps:
+      - uses: actions/checkout@v4
+
+      # The console transcript and the script, from the `reproduce` job.
+      - uses: actions/download-artifact@v4
+        with:
+          name: reproducibility-report
+
+      - name: Install metacheck
+        run: |
+          Rscript -e '
+            options(repos = c(CRAN = paste0("https://p3m.dev/cran/__linux__/noble/", Sys.getenv("METACHECK_CRAN"))))
+            install.packages("pak")
+            pak::pkg_install(paste0("scienceverse/metacheck@", Sys.getenv("METACHECK_REF")))
+          '
+
+      - name: Compare reported and reproduced results
+        run: |
+          mkdir -p comparison
+          Rscript -e '
+            library(metacheck)
+            llm_use(FALSE)
+            script_name <- Sys.getenv("ENTRY_SCRIPT")
+
+            # GROBID takes a minute or two to start.
+            alive <- FALSE
+            for (i in 1:60) {
+              alive <- tryCatch(any(grepl("true", readLines("http://grobid:8070/api/isalive", warn = FALSE))),
+                                error = function(e) FALSE)
+              if (alive) break
+              Sys.sleep(5)
+            }
+            stopifnot(alive)
+
+            # The manuscript, converted inside this job.
+            convert_grobid("paper/manuscript.pdf", save_path = "comparison/manuscript.xml",
+                           api_url = "http://grobid:8070")
+            paper <- read("comparison/manuscript.xml")
+
+            # The results the code printed in the reproduce job.
+            transcript <- readLines("run/transcript.txt", warn = FALSE)
+            script     <- readLines(file.path("run", script_name), warn = FALSE)
+            tabs <- read_r_output(transcript, source_label = script_name, code_lines = script)
+            cat("Results read from the transcript:", length(tabs), "\n")
+            output <- if (length(tabs)) stat_results_long(tabs, source_file = script_name) else data.frame()
+
+            # Each reported test looked for in the output.
+            matched <- match_reported_output(paper, output, include_tables = TRUE)
+            write.csv(matched, "comparison/matches.csv", row.names = FALSE)
+            s <- attr(matched, "summary")
+            summary_line <- sprintf(paste("metacheck recognised %d statistical tests in the paper and found %d of them",
+                                          "in the output (%d fully, %d partly). Every other number in the paper must be",
+                                          "checked by hand."),
+                                    s$n_tests, s$n_found, s$n_full, s$n_partial)
+            writeLines(summary_line, "comparison/summary.txt")
+            cat(summary_line, "\n")
+
+            # Test only, while Solana is the example: the same PDF converted by the
+            # full GROBID 0.9.0 image must give the same reported tests.
+            ref <- "paper/reference_grobid_full.xml"
+            if (file.exists(ref)) {
+              tests_crf  <- extract_tests(paper)
+              tests_full <- extract_tests(read(ref))
+              check <- sprintf("Reported tests found: %d with the light GROBID image, %d with the full one.",
+                               NROW(tests_crf), NROW(tests_full))
+              writeLines(check, "comparison/conversion_check.txt")
+              cat(check, "\n")
+              stopifnot(NROW(tests_crf) == NROW(tests_full))
+            }
+          '
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: comparison-report
+          path: comparison/

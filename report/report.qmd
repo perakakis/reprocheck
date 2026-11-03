@@ -1,0 +1,39 @@
+---
+title: "Reproducibility check"
+format:
+  html:
+    embed-resources: true
+    toc: true
+---
+
+The authors' code was run unchanged in a clean environment set up with the R
+version the authors declared or, if they declared none, the one current when
+the materials were deposited, and with packages as CRAN held them on the
+snapshot date. This report records what happened. Whether
+the results match those reported in the article is assessed by the checker in
+the checklist issue.
+
+## Environment
+
+| | |
+|---|---|
+| R version | {{< meta r-version >}} |
+| CRAN snapshot | {{< meta cran-snapshot >}} (Posit Package Manager) |
+| Script run | `{{< meta entry-script >}}` |
+| Exit status | {{< meta exit-status >}} (0 means the script ran to the end without error) |
+
+## Figures
+
+Every figure the code drew, in the order it drew them.
+
+{{< include _figures.md >}}
+
+## Console transcript
+
+Every command, as R executed it, followed by its output.
+
+{{< include _transcript.md >}}
+
+## Session information
+
+{{< include _session_info.md >}}

@@ -1,0 +1,76 @@
+name: Reproducibility check
+description: Check that the code and data deposited with a manuscript reproduce its reported results.
+title: "Reproducibility check: <short title of the manuscript>"
+labels: ["reproducibility-check"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in one issue per manuscript. The workflow in `.github/workflows/reproduce.yml`
+        runs the authors' code; download its report from the **Actions** tab, under
+        *Artifacts*, and compare it with the article.
+
+  - type: input
+    id: article
+    attributes:
+      label: Article
+      description: Authors, year, title, and DOI or handle.
+    validations:
+      required: true
+
+  - type: input
+    id: deposit
+    attributes:
+      label: Deposit
+      description: Where the authors deposited code and data (OSF, Zenodo, GitHub…).
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: materials
+    attributes:
+      label: 1. Materials
+      options:
+        - label: Code is deposited.
+        - label: Data are deposited, or the article states why they cannot be.
+        - label: A README says which script to run and in which order.
+        - label: The software used is named, with versions.
+
+  - type: checkboxes
+    id: execution
+    attributes:
+      label: 2. Execution
+      options:
+        - label: The code ran to the end without error (exit status 0 in the report).
+        - label: No file had to be edited, added or renamed for it to run.
+        - label: The run finished in reasonable time.
+
+  - type: textarea
+    id: comparison
+    attributes:
+      label: 3. Reported against reproduced values
+      description: One row per result checked. Include figures as well as numbers.
+      value: |
+        | Result | Reported | Reproduced | Match |
+        |---|---|---|---|
+        |  |  |  |  |
+    validations:
+      required: true
+
+  - type: textarea
+    id: discrepancies
+    attributes:
+      label: 4. Discrepancies and requests to the authors
+      description: What differs, what could not be checked, and what the authors should change.
+
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: 5. Verdict
+      options:
+        - Reproduced
+        - Reproduced with minor discrepancies
+        - Not reproduced
+        - Could not be run
+    validations:
+      required: true

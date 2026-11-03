@@ -1,0 +1,9 @@
+run/
+report/_*.md
+report/*.png
+report/exit_status.txt
+report/report.html
+report/report_files/
+.Rhistory
+.DS_Store
+STATUS.md
