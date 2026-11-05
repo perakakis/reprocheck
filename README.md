@@ -34,6 +34,13 @@ were deposited, and produces a report that a checker compares with the article.
 5. **Checklist.** The checker opens an issue from the *Reproducibility check*
    template, compares reported and reproduced values, and records a verdict.
 
+## Origin
+
+reprocheck was proposed by Pandelis Perakakis as a reproducibility check
+before peer review for [Psicológica](https://psicologicajournal.com). It is
+currently being developed with a team formed at BrainHack Donostia 2026 (BCBL,
+Donostia-San Sebastián, 3–6 November 2026).
+
 ## Related work
 
 The check follows the principles of [CODECHECK](https://codecheck.org.uk):
