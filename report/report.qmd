@@ -21,20 +21,25 @@ the checklist issue.
 | CRAN snapshot | {{< meta cran-snapshot >}} (Posit Package Manager) |
 | Scripts run, in order | {{< meta entry-script >}} |
 | Result | {{< meta result >}} |
+| The deposit's `.Rprofile` | {{< meta authors-profile >}} |
+| The deposit's `renv.lock` | {{< meta renv-lock >}} |
 
 Each script was run in a fresh R session, from the root of the deposit, and
 found there the files written by the scripts before it. Each has its own
 section below: its exit status; the files it wrote, each compared with the
 file of the same name in the deposit; its figures, those drawn on screen and
 those saved as image files; the tables it saved as CSV or TSV; and its console
-transcript, with every command as R executed it followed by its output. Every
-file written is in the artifact of this run, under `run/`.
+transcript, with every command as R executed it followed by its output. A
+script still running after 60 minutes was stopped. Every file written is in
+the artifact of this run, under `run/`.
 
 {{< include _scripts.md >}}
 
 ## Deposited files no script wrote
 
-Files in the deposit, code aside, that none of the scripts wrote. Some are
+Files in the deposit that none of the scripts wrote, leaving out code (R, R
+Markdown and Quarto files), documentation (README, licence) and project files
+(renv, RStudio, git). Some are
 inputs, such as the data; any other is an output the authors deposited that
 this run did not produce, and whose origin the code does not show.
 

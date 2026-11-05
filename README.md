@@ -14,16 +14,19 @@ were deposited, and produces a report that a checker compares with the article.
    hold only a hidden `.gitkeep` in the template, so that nothing of ours is
    mistaken for the authors' files.
 2. **Environment.** Three values in `settings.env` describe the manuscript:
-   the R version current at the deposit date, the date of the CRAN snapshot to
-   install packages from, and the script or scripts to run, in order. The
-   workflow itself is not edited.
+   the R version the authors declared or, if they declared none, the one
+   current at the deposit date; the date of the CRAN snapshot to install
+   packages from; and the script or scripts to run, in order. The workflow
+   itself is not edited.
 3. **Run.** The checker starts the check by hand, from the **Actions** tab
    (*Run workflow*). Two checkboxes there add metacheck's inspection of the
    deposited files and its comparison of reported and reproduced tests. The
    run rebuilds the environment in a `rocker/r-ver` container, installs the
    packages the code loads from the dated snapshot, and runs each script in
    its own R session, in the order listed, so that scripts pass results to
-   one another only through the files they write.
+   one another only through the files they write. A deposited `.Rprofile` is
+   loaded after the check's own settings, unless it activates renv. A script
+   still running after 60 minutes is stopped.
 4. **Report.** The workflow renders `report/report.qmd` into an HTML report
    with one section per script. Each section gives the script's exit status,
    the files it wrote (each compared with the file of the same name in the

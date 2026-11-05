@@ -62,12 +62,25 @@ jobs:
 
       - name: Read and check settings.env
         id: read
+        env:
+          COMPARE: ${{ inputs.compare }}
         run: |
-          get() { grep -E "^$1=" settings.env | tail -n 1 | cut -d= -f2- | sed 's/[[:space:]]*$//'; }
+          # A line may have spaces around the key and the "="; the last line
+          # for a key counts.
+          get() { { grep -E "^[[:space:]]*$1[[:space:]]*=" settings.env || true; } | tail -n 1 | cut -d= -f2- \
+                    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
           R_VERSION=$(get R_VERSION)
           CRAN_SNAPSHOT=$(get CRAN_SNAPSHOT)
           ENTRY_SCRIPT=$(get ENTRY_SCRIPT)
           if [[ -z "$R_VERSION$CRAN_SNAPSHOT$ENTRY_SCRIPT" ]]; then
+            # Values on lines whose key is not recognised are an error, not
+            # an empty file.
+            other=$(grep -v -E '^[[:space:]]*(#|$)' settings.env \
+                      | grep -v -E '^[[:space:]]*(R_VERSION|CRAN_SNAPSHOT|ENTRY_SCRIPT)[[:space:]]*=[[:space:]]*$' || true)
+            if [[ -n "$other" ]]; then
+              echo "::error::settings.env has lines that are not R_VERSION=, CRAN_SNAPSHOT= or ENTRY_SCRIPT=: $other"
+              exit 1
+            fi
             echo "::notice::settings.env is not filled in yet, so nothing was run."
             echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -75,8 +88,19 @@ jobs:
           ok=true
           [[ "$R_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "::error::R_VERSION '$R_VERSION' is not of the form 4.3.1"; ok=false; }
-          [[ "$CRAN_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
-            || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not of the form 2023-10-07"; ok=false; }
+          if [[ "$CRAN_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            # A real calendar date, not in the future.
+            python3 -c "import datetime, sys; d = datetime.date.fromisoformat(sys.argv[1]); sys.exit(d > datetime.date.today())" \
+              "$CRAN_SNAPSHOT" 2> /dev/null \
+              || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not a real date, or is in the future"; ok=false; }
+          else
+            echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not of the form 2023-10-07"; ok=false
+          fi
+          # The container for that R version must exist.
+          if [[ "$R_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && command -v docker > /dev/null; then
+            docker manifest inspect "rocker/r-ver:$R_VERSION" > /dev/null 2>&1 \
+              || { echo "::error::R_VERSION '$R_VERSION' has no rocker/r-ver container; check the version against https://cran.r-project.org/src/base/R-4/"; ok=false; }
+          fi
           # ENTRY_SCRIPT is one script or a comma-separated list, run in that
           # order; spaces around the commas are dropped, and every script must
           # be a file in manuscript/. The list goes on as "a.R,b.R".
@@ -85,11 +109,17 @@ jobs:
           for s in "${entries[@]}"; do
             s=$(echo "$s" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
             [[ -z "$s" ]] && continue
-            [[ -f "manuscript/$s" ]] \
-              || { echo "::error::ENTRY_SCRIPT '$s' is not a file in manuscript/"; ok=false; }
+            if [[ "$s" == /* || "/$s/" == */../* ]]; then
+              echo "::error::ENTRY_SCRIPT '$s' must be a path inside manuscript/, without .. or a leading /"; ok=false
+            elif [[ ! -f "manuscript/$s" ]]; then
+              echo "::error::ENTRY_SCRIPT '$s' is not a file in manuscript/"; ok=false
+            fi
             scripts="${scripts:+$scripts,}$s"
           done
           [[ -n "$scripts" ]] || { echo "::error::ENTRY_SCRIPT names no script"; ok=false; }
+          if [[ "$COMPARE" == "true" && ! -f paper/manuscript.pdf ]]; then
+            echo "::error::Compare was ticked, but there is no paper/manuscript.pdf"; ok=false
+          fi
           $ok
           {
             echo "R_VERSION=$R_VERSION"
@@ -151,40 +181,62 @@ jobs:
       - uses: actions/checkout@v4
 
       # Environment ####
-      # Every R session in this job reads this profile: CRAN is pinned to the
-      # snapshot, and any figure the authors' code draws is written as a PNG
-      # into run/_reprocheck/ instead of the default Rplots.pdf, named after
-      # the script's place in the list (02_figure-01.png is the first figure
-      # of the second script), so that no script overwrites another's.
+      # Every R session in this job reads this profile, kept outside the copy
+      # of the deposit so that a deposited .Rprofile cannot replace it. CRAN
+      # is pinned to the snapshot, and any figure the authors' code draws is
+      # written as a PNG into run/_reprocheck/ instead of the default
+      # Rplots.pdf, named after the script's place in the list, the graphics
+      # device and the page (02_figure-01-03.png is the third page of the
+      # first device of the second script), so that no figure overwrites
+      # another, even after dev.off(). When the run step sets
+      # RC_AUTHORS_PROFILE=load, the deposit's own .Rprofile is then loaded,
+      # as R would have loaded it on the authors' computer.
       - name: Pin CRAN snapshot and figure device
         run: |
-          mkdir -p run/_reprocheck
+          mkdir -p run/_reprocheck reprocheck_profile
           # Ready-built packages must match the container's Ubuntu release
           # (jammy for R 4.3 and earlier, noble from R 4.4), read from the system.
           . /etc/os-release
-          cat > run/.Rprofile <<EOF
+          cat > reprocheck_profile/Rprofile <<EOF
           options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/${VERSION_CODENAME}/${CRAN_SNAPSHOT}"))
-          options(device = function(...) grDevices::png(
-            file.path("${GITHUB_WORKSPACE}", "run", "_reprocheck",
-                      paste0(Sys.getenv("RC_SCRIPT_NUMBER", "00"), "_figure-%02d.png")),
-            width = 1600, height = 1200, res = 200))
+          local({
+            device_number <- 0
+            options(device = function(...) {
+              device_number <<- device_number + 1
+              grDevices::png(file.path("${GITHUB_WORKSPACE}", "run", "_reprocheck",
+                                       sprintf("%s_figure-%02d-%%02d.png",
+                                               Sys.getenv("RC_SCRIPT_NUMBER", "00"), device_number)),
+                             width = 1600, height = 1200, res = 200)
+            })
+          })
+          if (identical(Sys.getenv("RC_AUTHORS_PROFILE"), "load") && file.exists(".Rprofile")) source(".Rprofile")
           EOF
-          echo "R_PROFILE_USER=${GITHUB_WORKSPACE}/run/.Rprofile" >> "$GITHUB_ENV"
+          echo "R_PROFILE_USER=${GITHUB_WORKSPACE}/reprocheck_profile/Rprofile" >> "$GITHUB_ENV"
 
       # Dependencies ####
-      # Packages are read from library() and require() calls in the authors'
-      # scripts, in manuscript/ and its subfolders, and installed from the snapshot, so the versions are those the
-      # authors could have had.
+      # Packages are read from library(), require() and requireNamespace()
+      # calls in the authors' scripts, in manuscript/ and its subfolders,
+      # every call on a line, with or without quotes, comments left out; and
+      # installed from the snapshot, so the versions are those the authors
+      # could have had. Base packages are skipped, and so are calls with
+      # character.only = TRUE, whose argument is a variable.
       - name: Install the packages the code loads
+        shell: bash
         run: |
-          Rscript -e '
-            files <- list.files("manuscript", pattern = "[.][Rr]$", full.names = TRUE, recursive = TRUE)
-            code  <- unlist(lapply(files, readLines, warn = FALSE))
-            hits  <- regmatches(code, regexpr("(library|require)\\(([A-Za-z0-9.]+)", code))
-            pkgs  <- unique(sub(".*\\(", "", hits))
-            cat("Packages found:", pkgs, "\n")
-            if (length(pkgs) > 0) install.packages(pkgs)
-          '
+          finder=$(mktemp)
+          cat > "$finder" <<'EOF'
+          files <- list.files("manuscript", pattern = "[.][Rr]$", full.names = TRUE, recursive = TRUE)
+          code  <- unlist(lapply(files, readLines, warn = FALSE))
+          code  <- sub("#.*$", "", code)
+          code  <- code[!grepl("character[.]only[[:space:]]*=[[:space:]]*(TRUE|T)", code)]
+          pattern <- "(library|require|requireNamespace)[(][[:space:]]*[\"']?[A-Za-z][A-Za-z0-9.]*[\"']?[[:space:]]*[,)]"
+          calls <- unlist(regmatches(code, gregexpr(pattern, code)))
+          pkgs  <- unique(gsub("^[^(]*[(][[:space:]]*[\"']?|[\"']?[[:space:]]*[,)]$", "", calls))
+          pkgs  <- setdiff(pkgs, rownames(installed.packages(priority = "base")))
+          cat("Packages found:", pkgs, "\n")
+          if (length(pkgs) > 0) install.packages(pkgs)
+          EOF
+          Rscript "$finder"
 
       # Run ####
       # The code runs from a copy of manuscript/, so the deposited files stay
@@ -196,19 +248,34 @@ jobs:
       # reprocheck records goes to run/_reprocheck/, numbered by the script's
       # place in the list: NN_script.txt, NN_transcript.txt, NN_exit_status.txt.
       #
-      # Every file a script writes (any file whose modification time is later
-      # than the script's start) is recorded in NN_files.tsv: path, how it
-      # compares with the file of the same name in the deposit (new,
-      # identical, differs) and size. Deposited files that no script wrote,
-      # apart from code, are listed in not_rewritten.txt: they are inputs,
-      # such as the data, or outputs the authors deposited that this run did
-      # not produce.
+      # Every file a script writes (any file under run/ whose modification
+      # time is later than the script's start) is recorded in NN_files.tsv:
+      # path, how it compares with the file of the same name in the deposit
+      # (new, identical, differs) and size; images, CSV and TSV files are
+      # also copied as they were when the script ended, into NN_files/, for
+      # the report. Deposited files that no script wrote, code and
+      # documentation aside, are listed in not_rewritten.txt: they are
+      # inputs, such as the data, or outputs the authors deposited that this
+      # run did not produce.
+      #
+      # A script still running after 60 minutes is stopped (exit status 124).
+      # The deposit's .Rprofile, if any, is loaded after reprocheck's
+      # settings, unless it activates renv: renv's package library is rebuilt
+      # from renv.lock, which reprocheck does not do yet, so the packages
+      # come from the snapshot and the report says so.
       - name: Run the authors' code
         shell: bash
         run: |
           cp -R manuscript/. run/
           cd run
           rc=_reprocheck
+          if [[ -f .Rprofile ]]; then
+            if grep -q "renv" .Rprofile; then profile=renv; else profile=load; fi
+          else
+            profile=none
+          fi
+          echo "$profile" > "$rc/authors_profile.txt"
+          [[ -f renv.lock ]] && echo yes > "$rc/renv_lock.txt"
           IFS=',' read -ra scripts <<< "${ENTRY_SCRIPT}"
           failed=""
           n=0
@@ -218,7 +285,8 @@ jobs:
             echo "$s" > "$rc/${nn}_script.txt"
             touch "$rc/${nn}_start"
             set +e
-            RC_SCRIPT_NUMBER="$nn" R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
+            RC_SCRIPT_NUMBER="$nn" RC_AUTHORS_PROFILE="$profile" \
+              timeout 60m R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
             status=$?
             set -e
             echo "$status" > "$rc/${nn}_exit_status.txt"
@@ -240,11 +308,21 @@ jobs:
                   how="differs from the deposited file"
                 fi
                 printf '%s\t%s\t%s\n' "$p" "$how" "$(wc -c < "$p" | tr -d ' ')" >> "$rc/${nn}_files.tsv"
+                if [[ "$p" =~ [.]([Pp][Nn][Gg]|[Jj][Pp][Ee]?[Gg]|[Gg][Ii][Ff]|[Ss][Vv][Gg]|[Cc][Ss][Vv]|[Tt][Ss][Vv])$ ]]; then
+                  mkdir -p "$rc/${nn}_files/$(dirname "$p")"
+                  cp "$p" "$rc/${nn}_files/$p"
+                fi
               done
           done
-          # Deposited files, code aside, that no script wrote.
+          # Deposited files that no script wrote, leaving out code (R, R
+          # Markdown, Quarto), documentation (README, licence) and project
+          # files (renv, RStudio, git).
           cut -f1 "$rc"/[0-9][0-9]_files.tsv | sort -u > "$rc/written.txt"
-          (cd ../manuscript && find . -type f ! -name .gitkeep ! -name .DS_Store ! -iname '*.r' \
+          (cd ../manuscript && find . -type f ! -name .gitkeep ! -name .DS_Store \
+              ! -iname '*.r' ! -iname '*.rmd' ! -iname '*.qmd' \
+              ! -iname 'readme*' ! -iname 'licen[cs]e*' \
+              ! -iname '*.rproj' ! -name renv.lock ! -name .Rprofile ! -name .Rhistory ! -name .gitignore \
+              ! -path './renv/*' ! -path './.Rproj.user/*' ! -path './.git/*' \
             | sed 's#^\./##' | sort) > "$rc/deposited.txt"
           comm -23 "$rc/deposited.txt" "$rc/written.txt" > "$rc/not_rewritten.txt"
           # The result over all scripts, as the report shows it.
@@ -270,7 +348,18 @@ jobs:
         run: |
           /rocker_scripts/install_quarto.sh
           rc=run/_reprocheck
-          { echo '```'; cat "$rc/session_info.txt"; echo '```'; } > report/_session_info.md
+          # A text file as a code block: the fence is longer than any run of
+          # backticks inside the file, and Quarto shortcodes ({{< >}}) in it
+          # are escaped, so that it is shown exactly as written.
+          as_code() {
+            local longest fence
+            longest=$({ grep -o '`*' "$1" || true; } | awk '{ if (length($0) > n) n = length($0) } END { print n + 0 }')
+            fence=$(printf '%*s' $(( longest < 3 ? 3 : longest + 1 )) '' | tr ' ' '`')
+            echo "$fence"
+            sed 's/{{</{{{</g; s/>}}/>}}}/g' "$1"
+            echo "$fence"
+          }
+          as_code "$rc/session_info.txt" > report/_session_info.md
           : > report/_scripts.md
           for f in "$rc"/[0-9][0-9]_script.txt; do
             nn=$(basename "$f" _script.txt)
@@ -279,7 +368,12 @@ jobs:
             {
               echo "## ${nn#0}. \`$s\`"
               echo
-              echo "Exit status: $(cat "$rc/${nn}_exit_status.txt") (0 means the script ran to the end without error)."
+              status=$(cat "$rc/${nn}_exit_status.txt")
+              if [[ "$status" == 124 ]]; then
+                echo "Exit status: 124. The script was stopped after running for 60 minutes."
+              else
+                echo "Exit status: $status (0 means the script ran to the end without error)."
+              fi
               echo
               echo "### Files written"
               echo
@@ -287,7 +381,7 @@ jobs:
                 echo "| File | Compared with the deposit | Size (bytes) |"
                 echo "|---|---|---:|"
                 while IFS=$'\t' read -r p how bytes; do
-                  echo "| \`$p\` | $how | $bytes |"
+                  echo "| \`${p//|/\\|}\` | $how | $bytes |"
                 done < "$files"
               else
                 echo "None."
@@ -296,6 +390,7 @@ jobs:
               # Figures drawn on screen, and image files the script saved.
               saved=$(cut -f1 "$files" | grep -i -E '[.](png|jpe?g|gif|svg)$' || true)
               if ls "$rc/${nn}"_figure-*.png > /dev/null 2>&1 || [[ -n "$saved" ]]; then
+                # Images as they were when this script ended (NN_files/).
                 echo "### Figures"
                 echo
                 for p in "$rc/${nn}"_figure-*.png; do
@@ -307,17 +402,20 @@ jobs:
                 while IFS= read -r p; do
                   [[ -n "$p" ]] || continue
                   copy="${nn}_saved_$(echo "$p" | tr '/ ' '__')"
-                  cp "run/$p" "report/$copy"
-                  echo "![\`$p\`]($copy){width=80%}"
+                  if cp "$rc/${nn}_files/$p" "report/$copy" 2> /dev/null; then
+                    echo "![\`$p\`]($copy){width=80%}"
+                  else
+                    echo "\`$p\` could not be shown."
+                  fi
                   echo
                 done <<< "$saved"
               fi
-              # PDF figures cannot be embedded; they are in the artifact.
-              pdfs=$(cut -f1 "$files" | grep -i '[.]pdf$' || true)
-              if [[ -n "$pdfs" ]]; then
-                echo "PDF files are not shown here; they are in the artifact, under \`run/\`:"
+              # Figures in formats a web page cannot show; they are in the artifact.
+              others=$(cut -f1 "$files" | grep -i -E '[.](pdf|tiff?|eps|ps|bmp)$' || true)
+              if [[ -n "$others" ]]; then
+                echo "Figures in PDF, TIFF, EPS or BMP format are not shown here; they are in the artifact, under \`run/\`:"
                 echo
-                while IFS= read -r p; do echo "- \`$p\`"; done <<< "$pdfs"
+                while IFS= read -r p; do echo "- \`$p\`"; done <<< "$others"
                 echo
               fi
               # Tables written as CSV or TSV.
@@ -328,33 +426,47 @@ jobs:
                 while IFS= read -r p; do
                   echo "\`$p\`"
                   echo
-                  Rscript report/table_preview.R "run/$p"
+                  Rscript report/table_preview.R "$rc/${nn}_files/$p" | sed 's/{{</{{{</g; s/>}}/>}}}/g'
                   echo
                 done <<< "$tables"
               fi
               echo "### Console transcript"
               echo
-              echo '```'
-              cat "$rc/${nn}_transcript.txt"
-              echo '```'
+              as_code "$rc/${nn}_transcript.txt"
               echo
             } >> report/_scripts.md
           done
           if [[ -s "$rc/not_rewritten.txt" ]]; then
             while IFS= read -r p; do echo "- \`$p\`"; done < "$rc/not_rewritten.txt" > report/_not_rewritten.md
           else
-            echo "None: every deposited file other than code was written by a script." > report/_not_rewritten.md
+            echo "None: every deposited file other than code and documentation was written by a script." > report/_not_rewritten.md
+          fi
+          # The deposit's .Rprofile and renv.lock, for the Environment table.
+          case "$(cat "$rc/authors_profile.txt")" in
+            load) profile="loaded after reprocheck's settings" ;;
+            renv) profile="not loaded, because it activates renv, whose package library reprocheck does not yet rebuild from renv.lock; packages came from the CRAN snapshot" ;;
+            *)    profile="none in the deposit" ;;
+          esac
+          if [[ -f "$rc/renv_lock.txt" ]]; then
+            renv_lock="present, not yet used; packages came from the CRAN snapshot"
+          else
+            renv_lock="none in the deposit"
           fi
           cd report
           quarto render report.qmd \
             -M "r-version:${R_VERSION}" \
             -M "cran-snapshot:${CRAN_SNAPSHOT}" \
             -M "entry-script:${ENTRY_SCRIPT//,/, }" \
-            -M "result:$(cat "../$rc/result.txt")"
+            -M "result:$(cat "../$rc/result.txt")" \
+            -M "authors-profile:${profile}" \
+            -M "renv-lock:${renv_lock}"
 
+      # Uploaded even when an earlier step failed, with hidden files.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: reproducibility-report
+          include-hidden-files: true
           path: |
             report/report.html
             run/

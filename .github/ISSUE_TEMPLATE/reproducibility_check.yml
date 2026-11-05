@@ -14,7 +14,7 @@ body:
     id: article
     attributes:
       label: Article
-      description: Authors, year, title, and DOI or handle.
+      description: Authors, year, title, journal, and DOI or handle.
     validations:
       required: true
 
