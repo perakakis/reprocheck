@@ -1,13 +1,15 @@
 # Reproducibility check: rebuilds the authors' computing environment as it was
 # when the materials were deposited, runs their code unchanged, and renders a
 # report with the console transcript, the figures and the session information.
+# Several scripts are run in the order listed, each in a fresh R session, so
+# they can pass results to one another only through the files they write.
 # Two optional jobs use metacheck: `inspect` reads the deposited files before
 # anything is run, and `compare` looks for the paper's reported tests in the
 # output. They are chosen with the checkboxes under "Run workflow"; on a push,
 # `inspect` runs and `compare` does not. The reproduction never depends on them.
 #
 # The three values a checker sets per manuscript (R version, CRAN snapshot,
-# entry script) are in settings.env at the root of the repository; this file
+# script or scripts to run) are in settings.env at the root of the repository; this file
 # is not edited per manuscript. The code in manuscript/ is never edited: whatever it needs to run is a finding
 # for the checklist issue, not a fix.
 
@@ -77,13 +79,24 @@ jobs:
             || { echo "::error::R_VERSION '$R_VERSION' is not of the form 4.3.1"; ok=false; }
           [[ "$CRAN_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
             || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not of the form 2023-10-07"; ok=false; }
-          [[ -f "manuscript/$ENTRY_SCRIPT" ]] \
-            || { echo "::error::ENTRY_SCRIPT '$ENTRY_SCRIPT' is not a file in manuscript/"; ok=false; }
+          # ENTRY_SCRIPT is one script or a comma-separated list, run in that
+          # order; spaces around the commas are dropped, and every script must
+          # be a file in manuscript/. The list goes on as "a.R,b.R".
+          scripts=""
+          IFS=',' read -ra entries <<< "$ENTRY_SCRIPT"
+          for s in "${entries[@]}"; do
+            s=$(echo "$s" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ -z "$s" ]] && continue
+            [[ -f "manuscript/$s" ]] \
+              || { echo "::error::ENTRY_SCRIPT '$s' is not a file in manuscript/"; ok=false; }
+            scripts="${scripts:+$scripts,}$s"
+          done
+          [[ -n "$scripts" ]] || { echo "::error::ENTRY_SCRIPT names no script"; ok=false; }
           $ok
           {
             echo "R_VERSION=$R_VERSION"
             echo "CRAN_SNAPSHOT=$CRAN_SNAPSHOT"
-            echo "ENTRY_SCRIPT=$ENTRY_SCRIPT"
+            echo "ENTRY_SCRIPT=$scripts"
             echo "ready=true"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -142,17 +155,20 @@ jobs:
       # Environment ####
       # Every R session in this job reads this profile: CRAN is pinned to the
       # snapshot, and any figure the authors' code draws is written as a PNG
-      # into run/ instead of the default Rplots.pdf.
+      # into run/_reprocheck/ instead of the default Rplots.pdf, named after
+      # the script's place in the list (02_figure-01.png is the first figure
+      # of the second script), so that no script overwrites another's.
       - name: Pin CRAN snapshot and figure device
         run: |
-          mkdir -p run
+          mkdir -p run/_reprocheck
           # Ready-built packages must match the container's Ubuntu release
           # (jammy for R 4.3 and earlier, noble from R 4.4), read from the system.
           . /etc/os-release
           cat > run/.Rprofile <<EOF
           options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/${VERSION_CODENAME}/${CRAN_SNAPSHOT}"))
           options(device = function(...) grDevices::png(
-            file.path("${GITHUB_WORKSPACE}", "run", "figure-%02d.png"),
+            file.path("${GITHUB_WORKSPACE}", "run", "_reprocheck",
+                      paste0(Sys.getenv("RC_SCRIPT_NUMBER", "00"), "_figure-%02d.png")),
             width = 1600, height = 1200, res = 200))
           EOF
           echo "R_PROFILE_USER=${GITHUB_WORKSPACE}/run/.Rprofile" >> "$GITHUB_ENV"
@@ -174,38 +190,86 @@ jobs:
 
       # Run ####
       # The code runs from a copy of manuscript/, so the deposited files stay
-      # untouched. R echoes every command, which gives a transcript a checker
-      # can read line by line. A failure is recorded, not fatal: the report is
-      # still produced.
+      # untouched. Each script runs in its own R session, in the order listed,
+      # from the root of that copy, and finds there whatever files the scripts
+      # before it wrote. R echoes every command, which gives a transcript a
+      # checker can read line by line. A failure is recorded, not fatal: the
+      # scripts after it still run and the report is still produced. What
+      # reprocheck records goes to run/_reprocheck/, numbered by the script's
+      # place in the list: NN_script.txt, NN_transcript.txt, NN_exit_status.txt.
       - name: Run the authors' code
+        shell: bash
         run: |
           cp -R manuscript/. run/
           cd run
-          set +e
-          R --no-save --no-restore < "${ENTRY_SCRIPT}" > transcript.txt 2>&1
-          echo $? > exit_status.txt
+          rc=_reprocheck
+          IFS=',' read -ra scripts <<< "${ENTRY_SCRIPT}"
+          failed=""
+          n=0
+          for s in "${scripts[@]}"; do
+            n=$((n + 1))
+            nn=$(printf "%02d" "$n")
+            echo "$s" > "$rc/${nn}_script.txt"
+            set +e
+            RC_SCRIPT_NUMBER="$nn" R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
+            status=$?
+            set -e
+            echo "$status" > "$rc/${nn}_exit_status.txt"
+            echo "$s: exit status $status"
+            [[ "$status" -eq 0 ]] || failed="${failed:+$failed, }$s"
+          done
+          # The result over all scripts, as the report shows it.
+          if [[ -z "$failed" ]]; then
+            echo "every script ran to the end without error" > "$rc/result.txt"
+          else
+            echo "error in $failed" > "$rc/result.txt"
+          fi
           # R version, platform, and every package installed beyond base R.
-          Rscript -e 'print(sessionInfo()); ip <- installed.packages(priority = "NA"); print(ip[, c("Package", "Version")], quote = FALSE, row.names = FALSE)' > session_info.txt 2>&1
-          echo "Exit status: $(cat exit_status.txt)"
+          Rscript -e 'print(sessionInfo()); ip <- installed.packages(priority = "NA"); print(ip[, c("Package", "Version")], quote = FALSE, row.names = FALSE)' > "$rc/session_info.txt" 2>&1
+          echo "Result: $(cat "$rc/result.txt")"
 
       # Report ####
+      # One section per script, in the order run: its exit status, its
+      # figures and its console transcript, written to report/_scripts.md;
+      # the session information, once, to report/_session_info.md.
       - name: Render the report
+        shell: bash
         run: |
           /rocker_scripts/install_quarto.sh
-          # Transcript and session information go into the report as code blocks.
-          for f in transcript session_info; do
-            { echo '```'; cat "run/$f.txt"; echo '```'; } > "report/_$f.md"
+          rc=run/_reprocheck
+          { echo '```'; cat "$rc/session_info.txt"; echo '```'; } > report/_session_info.md
+          : > report/_scripts.md
+          for f in "$rc"/[0-9][0-9]_script.txt; do
+            nn=$(basename "$f" _script.txt)
+            s=$(cat "$f")
+            {
+              echo "## ${nn#0}. \`$s\`"
+              echo
+              echo "Exit status: $(cat "$rc/${nn}_exit_status.txt") (0 means the script ran to the end without error)."
+              echo
+              if ls "$rc/${nn}"_figure-*.png > /dev/null 2>&1; then
+                echo "### Figures"
+                echo
+                for p in "$rc/${nn}"_figure-*.png; do
+                  cp "$p" report/
+                  echo "![]($(basename "$p")){width=80%}"
+                  echo
+                done
+              fi
+              echo "### Console transcript"
+              echo
+              echo '```'
+              cat "$rc/${nn}_transcript.txt"
+              echo '```'
+              echo
+            } >> report/_scripts.md
           done
-          cp run/exit_status.txt report/
-          cp run/figure-*.png report/ 2>/dev/null || true
-          ls report/figure-*.png 2>/dev/null \
-            | sed 's#report/##; s#.*#![](&){width=80%}\n#' > report/_figures.md
           cd report
           quarto render report.qmd \
             -M "r-version:${R_VERSION}" \
             -M "cran-snapshot:${CRAN_SNAPSHOT}" \
-            -M "entry-script:${ENTRY_SCRIPT}" \
-            -M "exit-status:$(cat exit_status.txt)"
+            -M "entry-script:${ENTRY_SCRIPT//,/, }" \
+            -M "result:$(cat "../$rc/result.txt")"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -226,8 +290,6 @@ jobs:
     needs: [settings, reproduce]
     runs-on: ubuntu-latest
     container: rocker/r-ver:4.6.0
-    env:
-      ENTRY_SCRIPT: ${{ needs.settings.outputs.entry_script }}
     services:
       # The light GROBID image (0.5 GB) of the version metacheck uses; the full
       # image is 10 GB.
@@ -255,7 +317,6 @@ jobs:
           Rscript -e '
             library(metacheck)
             llm_use(FALSE)
-            script_name <- Sys.getenv("ENTRY_SCRIPT")
 
             # GROBID takes a minute or two to start.
             alive <- FALSE
@@ -272,12 +333,20 @@ jobs:
                            api_url = "http://grobid:8070")
             paper <- read("comparison/manuscript.xml")
 
-            # The results the code printed in the reproduce job.
-            transcript <- readLines("run/transcript.txt", warn = FALSE)
-            script     <- readLines(file.path("run", script_name), warn = FALSE)
-            tabs <- read_r_output(transcript, source_label = script_name, code_lines = script)
-            cat("Results read from the transcript:", length(tabs), "\n")
-            output <- if (length(tabs)) stat_results_long(tabs, source_file = script_name) else data.frame()
+            # The results each script printed in the reproduce job, read from
+            # its transcript and put together in one table.
+            rc <- file.path("run", "_reprocheck")
+            numbers <- sub("_script[.]txt$", "", list.files(rc, pattern = "^[0-9]{2}_script[.]txt$"))
+            outputs <- list()
+            for (nn in numbers) {
+              script_name <- readLines(file.path(rc, paste0(nn, "_script.txt")), warn = FALSE)
+              transcript  <- readLines(file.path(rc, paste0(nn, "_transcript.txt")), warn = FALSE)
+              script      <- readLines(file.path("run", script_name), warn = FALSE)
+              tabs <- read_r_output(transcript, source_label = script_name, code_lines = script)
+              cat("Results read from the transcript of", script_name, ":", length(tabs), "\n")
+              if (length(tabs)) outputs[[nn]] <- stat_results_long(tabs, source_file = script_name)
+            }
+            output <- if (length(outputs)) do.call(rbind, outputs) else data.frame()
 
             # Each reported test looked for in the output.
             matched <- match_reported_output(paper, output, include_tables = TRUE)

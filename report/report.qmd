@@ -19,20 +19,16 @@ the checklist issue.
 |---|---|
 | R version | {{< meta r-version >}} |
 | CRAN snapshot | {{< meta cran-snapshot >}} (Posit Package Manager) |
-| Script run | `{{< meta entry-script >}}` |
-| Exit status | {{< meta exit-status >}} (0 means the script ran to the end without error) |
+| Scripts run, in order | {{< meta entry-script >}} |
+| Result | {{< meta result >}} |
 
-## Figures
+Each script was run in a fresh R session, from the root of the deposit, and
+found there the files written by the scripts before it. Each has its own
+section below: its exit status, every figure it drew, in the order it drew
+them, and its console transcript, with every command as R executed it
+followed by its output.
 
-Every figure the code drew, in the order it drew them.
-
-{{< include _figures.md >}}
-
-## Console transcript
-
-Every command, as R executed it, followed by its output.
-
-{{< include _transcript.md >}}
+{{< include _scripts.md >}}
 
 ## Session information
 
