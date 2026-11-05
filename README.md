@@ -15,17 +15,22 @@ were deposited, and produces a report that a checker compares with the article.
    mistaken for the authors' files.
 2. **Environment.** Three values in `settings.env` describe the manuscript:
    the R version current at the deposit date, the date of the CRAN snapshot to
-   install packages from, and the script to run. The workflow itself is not
-   edited.
-3. **Run.** Committing `settings.env`, or starting the workflow by hand from the
-   **Actions** tab (*Run workflow*, where two checkboxes add metacheck's
-   inspection of the deposited files and its comparison of reported and
-   reproduced tests), rebuilds the environment in a `rocker/r-ver` container,
-   installs the packages the code loads from the dated snapshot, and runs the
-   script.
+   install packages from, and the script or scripts to run, in order. The
+   workflow itself is not edited.
+3. **Run.** The checker starts the check by hand, from the **Actions** tab
+   (*Run workflow*). Two checkboxes there add metacheck's inspection of the
+   deposited files and its comparison of reported and reproduced tests. The
+   run rebuilds the environment in a `rocker/r-ver` container, installs the
+   packages the code loads from the dated snapshot, and runs each script in
+   its own R session, in the order listed, so that scripts pass results to
+   one another only through the files they write.
 4. **Report.** The workflow renders `report/report.qmd` into an HTML report
-   with the exit status, every figure, the full console transcript and the
-   package versions. It is attached to the run under *Artifacts*.
+   with one section per script. Each section gives the script's exit status,
+   the files it wrote (each compared with the file of the same name in the
+   deposit), its figures, the tables it saved as CSV or TSV, and its full
+   console transcript. The sections are followed by a list of the deposited
+   files that no script wrote and by the package versions. The report and every file the
+   scripts wrote are attached to the run under *Artifacts*.
 5. **Checklist.** The checker opens an issue from the *Reproducibility check*
    template, compares reported and reproduced values, and records a verdict.
 
