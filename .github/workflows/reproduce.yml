@@ -5,8 +5,13 @@
 # they can pass results to one another only through the files they write.
 # Two optional jobs use metacheck: `inspect` reads the deposited files before
 # anything is run, and `compare` looks for the paper's reported tests in the
-# output. They are chosen with the checkboxes under "Run workflow"; on a push,
-# `inspect` runs and `compare` does not. The reproduction never depends on them.
+# output. They are chosen with the checkboxes under "Run workflow". The
+# reproduction never depends on them.
+#
+# A check starts only from Actions > Reproduce > Run workflow, never from a
+# commit: the checker uploads the deposit, fills in settings.env and then
+# starts the run, choosing the optional jobs. After the authors correct their
+# deposit, the check is run again the same way.
 #
 # The three values a checker sets per manuscript (R version, CRAN snapshot,
 # script or scripts to run) are in settings.env at the root of the repository; this file
@@ -26,13 +31,6 @@ on:
         description: "Compare reported and reproduced results with metacheck (needs paper/manuscript.pdf)"
         type: boolean
         default: false
-  # Only a change to settings.env starts a run, so the checker uploads the
-  # authors' files first and fills in the settings last; that commit starts
-  # the check. After the authors correct their deposit, the check is run again
-  # with "Run workflow".
-  push:
-    paths:
-      - "settings.env"
 
 env:
   # The metacheck used by `inspect` and `compare`.
@@ -109,7 +107,7 @@ jobs:
   # no links and downloads nothing, and the language model is switched off.
   inspect:
     needs: settings
-    if: needs.settings.outputs.ready == 'true' && (github.event_name == 'push' || inputs.inspect)
+    if: needs.settings.outputs.ready == 'true' && inputs.inspect
     runs-on: ubuntu-latest
     container: rocker/r-ver:4.6.0
     steps:
@@ -197,6 +195,14 @@ jobs:
       # scripts after it still run and the report is still produced. What
       # reprocheck records goes to run/_reprocheck/, numbered by the script's
       # place in the list: NN_script.txt, NN_transcript.txt, NN_exit_status.txt.
+      #
+      # Every file a script writes (any file whose modification time is later
+      # than the script's start) is recorded in NN_files.tsv: path, how it
+      # compares with the file of the same name in the deposit (new,
+      # identical, differs) and size. Deposited files that no script wrote,
+      # apart from code, are listed in not_rewritten.txt: they are inputs,
+      # such as the data, or outputs the authors deposited that this run did
+      # not produce.
       - name: Run the authors' code
         shell: bash
         run: |
@@ -210,6 +216,7 @@ jobs:
             n=$((n + 1))
             nn=$(printf "%02d" "$n")
             echo "$s" > "$rc/${nn}_script.txt"
+            touch "$rc/${nn}_start"
             set +e
             RC_SCRIPT_NUMBER="$nn" R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
             status=$?
@@ -217,7 +224,29 @@ jobs:
             echo "$status" > "$rc/${nn}_exit_status.txt"
             echo "$s: exit status $status"
             [[ "$status" -eq 0 ]] || failed="${failed:+$failed, }$s"
+            # The files this script wrote.
+            : > "$rc/${nn}_files.tsv"
+            find . -type f -newer "$rc/${nn}_start" ! -path "./$rc/*" ! -name .Rprofile \
+              | sed 's#^\./##' | sort | while IFS= read -r p; do
+                if [[ ! -e "../manuscript/$p" ]]; then
+                  how="new"
+                elif cmp -s "$p" "../manuscript/$p"; then
+                  how="identical to the deposited file"
+                elif [[ "$p" =~ [.]([Pp][Dd][Ff]|[Dd][Oo][Cc][Xx]|[Xx][Ll][Ss][Xx]|[Pp][Pp][Tt][Xx])$ ]]; then
+                  # These formats record when they were made, so a new copy
+                  # never matches byte for byte.
+                  how="differs from the deposited file, perhaps only in the date recorded inside it"
+                else
+                  how="differs from the deposited file"
+                fi
+                printf '%s\t%s\t%s\n' "$p" "$how" "$(wc -c < "$p" | tr -d ' ')" >> "$rc/${nn}_files.tsv"
+              done
           done
+          # Deposited files, code aside, that no script wrote.
+          cut -f1 "$rc"/[0-9][0-9]_files.tsv | sort -u > "$rc/written.txt"
+          (cd ../manuscript && find . -type f ! -name .gitkeep ! -name .DS_Store ! -iname '*.r' \
+            | sed 's#^\./##' | sort) > "$rc/deposited.txt"
+          comm -23 "$rc/deposited.txt" "$rc/written.txt" > "$rc/not_rewritten.txt"
           # The result over all scripts, as the report shows it.
           if [[ -z "$failed" ]]; then
             echo "every script ran to the end without error" > "$rc/result.txt"
@@ -229,9 +258,13 @@ jobs:
           echo "Result: $(cat "$rc/result.txt")"
 
       # Report ####
-      # One section per script, in the order run: its exit status, its
-      # figures and its console transcript, written to report/_scripts.md;
-      # the session information, once, to report/_session_info.md.
+      # One section per script, in the order run: its exit status, the files
+      # it wrote, its figures (drawn on screen, and saved as image files),
+      # its tables (CSV and TSV files it wrote, shown by
+      # report/table_preview.R) and its console transcript, written to
+      # report/_scripts.md; the deposited files no script wrote to
+      # report/_not_rewritten.md; the session information, once, to
+      # report/_session_info.md.
       - name: Render the report
         shell: bash
         run: |
@@ -242,19 +275,62 @@ jobs:
           for f in "$rc"/[0-9][0-9]_script.txt; do
             nn=$(basename "$f" _script.txt)
             s=$(cat "$f")
+            files="$rc/${nn}_files.tsv"
             {
               echo "## ${nn#0}. \`$s\`"
               echo
               echo "Exit status: $(cat "$rc/${nn}_exit_status.txt") (0 means the script ran to the end without error)."
               echo
-              if ls "$rc/${nn}"_figure-*.png > /dev/null 2>&1; then
+              echo "### Files written"
+              echo
+              if [[ -s "$files" ]]; then
+                echo "| File | Compared with the deposit | Size (bytes) |"
+                echo "|---|---|---:|"
+                while IFS=$'\t' read -r p how bytes; do
+                  echo "| \`$p\` | $how | $bytes |"
+                done < "$files"
+              else
+                echo "None."
+              fi
+              echo
+              # Figures drawn on screen, and image files the script saved.
+              saved=$(cut -f1 "$files" | grep -i -E '[.](png|jpe?g|gif|svg)$' || true)
+              if ls "$rc/${nn}"_figure-*.png > /dev/null 2>&1 || [[ -n "$saved" ]]; then
                 echo "### Figures"
                 echo
                 for p in "$rc/${nn}"_figure-*.png; do
+                  [[ -e "$p" ]] || continue
                   cp "$p" report/
-                  echo "![]($(basename "$p")){width=80%}"
+                  echo "![Drawn on screen]($(basename "$p")){width=80%}"
                   echo
                 done
+                while IFS= read -r p; do
+                  [[ -n "$p" ]] || continue
+                  copy="${nn}_saved_$(echo "$p" | tr '/ ' '__')"
+                  cp "run/$p" "report/$copy"
+                  echo "![\`$p\`]($copy){width=80%}"
+                  echo
+                done <<< "$saved"
+              fi
+              # PDF figures cannot be embedded; they are in the artifact.
+              pdfs=$(cut -f1 "$files" | grep -i '[.]pdf$' || true)
+              if [[ -n "$pdfs" ]]; then
+                echo "PDF files are not shown here; they are in the artifact, under \`run/\`:"
+                echo
+                while IFS= read -r p; do echo "- \`$p\`"; done <<< "$pdfs"
+                echo
+              fi
+              # Tables written as CSV or TSV.
+              tables=$(cut -f1 "$files" | grep -i -E '[.](csv|tsv)$' || true)
+              if [[ -n "$tables" ]]; then
+                echo "### Tables"
+                echo
+                while IFS= read -r p; do
+                  echo "\`$p\`"
+                  echo
+                  Rscript report/table_preview.R "run/$p"
+                  echo
+                done <<< "$tables"
               fi
               echo "### Console transcript"
               echo
@@ -264,6 +340,11 @@ jobs:
               echo
             } >> report/_scripts.md
           done
+          if [[ -s "$rc/not_rewritten.txt" ]]; then
+            while IFS= read -r p; do echo "- \`$p\`"; done < "$rc/not_rewritten.txt" > report/_not_rewritten.md
+          else
+            echo "None: every deposited file other than code was written by a script." > report/_not_rewritten.md
+          fi
           cd report
           quarto render report.qmd \
             -M "r-version:${R_VERSION}" \
@@ -286,7 +367,7 @@ jobs:
   # chi-square, correlations, regression tables); every other number in the
   # paper is left to the checker, and the summary says so.
   compare:
-    if: needs.settings.outputs.ready == 'true' && github.event_name == 'workflow_dispatch' && inputs.compare
+    if: needs.settings.outputs.ready == 'true' && inputs.compare
     needs: [settings, reproduce]
     runs-on: ubuntu-latest
     container: rocker/r-ver:4.6.0
@@ -335,13 +416,25 @@ jobs:
 
             # The results each script printed in the reproduce job, read from
             # its transcript and put together in one table.
+            # metacheck skips the output of any statement that starts with
+            # print(), which it takes for a look at the data, like head();
+            # but scripts often print their results that way, and must do so
+            # inside loops and functions. So a statement that is a whole print(...) on one line
+            # is read as its argument alone, in copies of the transcript and
+            # the script made for metacheck; the files themselves are not
+            # changed.
+            unprint <- function(x) {
+              i <- grepl("^(> )?print[(].*[)][[:space:]]*$", x)
+              x[i] <- sub("[)][[:space:]]*$", "", sub("print[(]", "", x[i]))
+              x
+            }
             rc <- file.path("run", "_reprocheck")
             numbers <- sub("_script[.]txt$", "", list.files(rc, pattern = "^[0-9]{2}_script[.]txt$"))
             outputs <- list()
             for (nn in numbers) {
               script_name <- readLines(file.path(rc, paste0(nn, "_script.txt")), warn = FALSE)
-              transcript  <- readLines(file.path(rc, paste0(nn, "_transcript.txt")), warn = FALSE)
-              script      <- readLines(file.path("run", script_name), warn = FALSE)
+              transcript  <- unprint(readLines(file.path(rc, paste0(nn, "_transcript.txt")), warn = FALSE))
+              script      <- unprint(readLines(file.path("run", script_name), warn = FALSE))
               tabs <- read_r_output(transcript, source_label = script_name, code_lines = script)
               cat("Results read from the transcript of", script_name, ":", length(tabs), "\n")
               if (length(tabs)) outputs[[nn]] <- stat_results_long(tabs, source_file = script_name)
