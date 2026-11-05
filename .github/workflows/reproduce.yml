@@ -72,15 +72,16 @@ jobs:
           R_VERSION=$(get R_VERSION)
           CRAN_SNAPSHOT=$(get CRAN_SNAPSHOT)
           ENTRY_SCRIPT=$(get ENTRY_SCRIPT)
+          # A line that is not a comment, blank, or one of the three keys is
+          # an error.
+          other=$(grep -v -E '^[[:space:]]*(#|$)' settings.env \
+                    | grep -v -E '^[[:space:]]*(R_VERSION|CRAN_SNAPSHOT|ENTRY_SCRIPT)[[:space:]]*=' \
+                    | paste -s -d ';' - || true)
+          if [[ -n "$other" ]]; then
+            echo "::error::settings.env has lines that are not R_VERSION=, CRAN_SNAPSHOT= or ENTRY_SCRIPT=: $other"
+            exit 1
+          fi
           if [[ -z "$R_VERSION$CRAN_SNAPSHOT$ENTRY_SCRIPT" ]]; then
-            # Values on lines whose key is not recognised are an error, not
-            # an empty file.
-            other=$(grep -v -E '^[[:space:]]*(#|$)' settings.env \
-                      | grep -v -E '^[[:space:]]*(R_VERSION|CRAN_SNAPSHOT|ENTRY_SCRIPT)[[:space:]]*=[[:space:]]*$' || true)
-            if [[ -n "$other" ]]; then
-              echo "::error::settings.env has lines that are not R_VERSION=, CRAN_SNAPSHOT= or ENTRY_SCRIPT=: $other"
-              exit 1
-            fi
             echo "::notice::settings.env is not filled in yet, so nothing was run."
             echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -89,10 +90,11 @@ jobs:
           [[ "$R_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "::error::R_VERSION '$R_VERSION' is not of the form 4.3.1"; ok=false; }
           if [[ "$CRAN_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            # A real calendar date, not in the future.
-            python3 -c "import datetime, sys; d = datetime.date.fromisoformat(sys.argv[1]); sys.exit(d > datetime.date.today())" \
+            # A real calendar date, from the first day Posit Package Manager
+            # keeps a copy of CRAN (2017-10-10) to today.
+            python3 -c "import datetime as d, sys; x = d.date.fromisoformat(sys.argv[1]); sys.exit(not d.date(2017, 10, 10) <= x <= d.date.today())" \
               "$CRAN_SNAPSHOT" 2> /dev/null \
-              || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not a real date, or is in the future"; ok=false; }
+              || { echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not a real date between 2017-10-10 and today"; ok=false; }
           else
             echo "::error::CRAN_SNAPSHOT '$CRAN_SNAPSHOT' is not of the form 2023-10-07"; ok=false
           fi
@@ -190,14 +192,20 @@ jobs:
       # first device of the second script), so that no figure overwrites
       # another, even after dev.off(). When the run step sets
       # RC_AUTHORS_PROFILE=load, the deposit's own .Rprofile is then loaded,
-      # as R would have loaded it on the authors' computer.
+      # as R would have loaded it on the authors' computer. R would also read
+      # a deposited .Renviron at startup, before any profile, and it could
+      # replace this one (R_PROFILE_USER); so R is pointed to an empty
+      # environment file instead, and a deposited .Renviron is read by this
+      # profile, first.
       - name: Pin CRAN snapshot and figure device
         run: |
           mkdir -p run/_reprocheck reprocheck_profile
           # Ready-built packages must match the container's Ubuntu release
           # (jammy for R 4.3 and earlier, noble from R 4.4), read from the system.
           . /etc/os-release
+          : > reprocheck_profile/Renviron
           cat > reprocheck_profile/Rprofile <<EOF
+          if (file.exists(".Renviron")) readRenviron(".Renviron")
           options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/${VERSION_CODENAME}/${CRAN_SNAPSHOT}"))
           local({
             device_number <- 0
@@ -212,31 +220,16 @@ jobs:
           if (identical(Sys.getenv("RC_AUTHORS_PROFILE"), "load") && file.exists(".Rprofile")) source(".Rprofile")
           EOF
           echo "R_PROFILE_USER=${GITHUB_WORKSPACE}/reprocheck_profile/Rprofile" >> "$GITHUB_ENV"
+          echo "R_ENVIRON_USER=${GITHUB_WORKSPACE}/reprocheck_profile/Renviron" >> "$GITHUB_ENV"
 
       # Dependencies ####
-      # Packages are read from library(), require() and requireNamespace()
-      # calls in the authors' scripts, in manuscript/ and its subfolders,
-      # every call on a line, with or without quotes, comments left out; and
-      # installed from the snapshot, so the versions are those the authors
-      # could have had. Base packages are skipped, and so are calls with
-      # character.only = TRUE, whose argument is a variable.
+      # .github/scripts/find_packages.R reads the deposit's R code and its
+      # .Rprofile with R's parser, finds every package loaded with library(),
+      # require(), requireNamespace() or loadNamespace() or used as
+      # pkg::function(), and installs those from the snapshot, so the
+      # versions are those the authors could have had.
       - name: Install the packages the code loads
-        shell: bash
-        run: |
-          finder=$(mktemp)
-          cat > "$finder" <<'EOF'
-          files <- list.files("manuscript", pattern = "[.][Rr]$", full.names = TRUE, recursive = TRUE)
-          code  <- unlist(lapply(files, readLines, warn = FALSE))
-          code  <- sub("#.*$", "", code)
-          code  <- code[!grepl("character[.]only[[:space:]]*=[[:space:]]*(TRUE|T)", code)]
-          pattern <- "(library|require|requireNamespace)[(][[:space:]]*[\"']?[A-Za-z][A-Za-z0-9.]*[\"']?[[:space:]]*[,)]"
-          calls <- unlist(regmatches(code, gregexpr(pattern, code)))
-          pkgs  <- unique(gsub("^[^(]*[(][[:space:]]*[\"']?|[\"']?[[:space:]]*[,)]$", "", calls))
-          pkgs  <- setdiff(pkgs, rownames(installed.packages(priority = "base")))
-          cat("Packages found:", pkgs, "\n")
-          if (length(pkgs) > 0) install.packages(pkgs)
-          EOF
-          Rscript "$finder"
+        run: Rscript .github/scripts/find_packages.R manuscript
 
       # Run ####
       # The code runs from a copy of manuscript/, so the deposited files stay
@@ -258,7 +251,10 @@ jobs:
       # inputs, such as the data, or outputs the authors deposited that this
       # run did not produce.
       #
-      # A script still running after 60 minutes is stopped (exit status 124).
+      # A script still running after 60 minutes is stopped (exit status 124),
+      # and all the scripts together have five hours: a script that would
+      # start after that is not run, so that the report is still produced
+      # within GitHub's six-hour limit for a job.
       # The deposit's .Rprofile, if any, is loaded after reprocheck's
       # settings, unless it activates renv: renv's package library is rebuilt
       # from renv.lock, which reprocheck does not do yet, so the packages
@@ -270,7 +266,14 @@ jobs:
           cd run
           rc=_reprocheck
           if [[ -f .Rprofile ]]; then
-            if grep -q "renv" .Rprofile; then profile=renv; else profile=load; fi
+            # renv is active when a line that is not a comment sources
+            # renv/activate.R or calls renv::activate() or renv::load().
+            if grep -v -E '^[[:space:]]*#' .Rprofile \
+                 | grep -q -E 'renv/activate[.]R|renv::(activate|load)[(]'; then
+              profile=renv
+            else
+              profile=load
+            fi
           else
             profile=none
           fi
@@ -279,26 +282,41 @@ jobs:
           IFS=',' read -ra scripts <<< "${ENTRY_SCRIPT}"
           failed=""
           n=0
+          budget=$(( 5 * 3600 ))
           for s in "${scripts[@]}"; do
             n=$((n + 1))
             nn=$(printf "%02d" "$n")
             echo "$s" > "$rc/${nn}_script.txt"
             touch "$rc/${nn}_start"
+            left=$(( budget - SECONDS ))
+            if (( left <= 0 )); then
+              echo "not run" > "$rc/${nn}_exit_status.txt"
+              : > "$rc/${nn}_transcript.txt"
+              : > "$rc/${nn}_files.tsv"
+              echo "$s: not run, five hours used up"
+              failed="${failed:+$failed, }$s (not run, the five hours for all scripts were used up)"
+              continue
+            fi
+            limit=$(( left < 3600 ? left : 3600 ))
             set +e
             RC_SCRIPT_NUMBER="$nn" RC_AUTHORS_PROFILE="$profile" \
-              timeout 60m R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
+              timeout "${limit}s" R --no-save --no-restore < "$s" > "$rc/${nn}_transcript.txt" 2>&1
             status=$?
             set -e
             echo "$status" > "$rc/${nn}_exit_status.txt"
             echo "$s: exit status $status"
-            [[ "$status" -eq 0 ]] || failed="${failed:+$failed, }$s"
+            if [[ "$status" -eq 124 ]]; then
+              failed="${failed:+$failed, }$s (stopped at the time limit)"
+            elif [[ "$status" -ne 0 ]]; then
+              failed="${failed:+$failed, }$s"
+            fi
             # The files this script wrote.
             : > "$rc/${nn}_files.tsv"
             find . -type f -newer "$rc/${nn}_start" ! -path "./$rc/*" ! -name .Rprofile \
               | sed 's#^\./##' | sort | while IFS= read -r p; do
                 if [[ ! -e "../manuscript/$p" ]]; then
                   how="new"
-                elif cmp -s "$p" "../manuscript/$p"; then
+                elif cmp -s "./$p" "../manuscript/$p"; then
                   how="identical to the deposited file"
                 elif [[ "$p" =~ [.]([Pp][Dd][Ff]|[Dd][Oo][Cc][Xx]|[Xx][Ll][Ss][Xx]|[Pp][Pp][Tt][Xx])$ ]]; then
                   # These formats record when they were made, so a new copy
@@ -307,10 +325,10 @@ jobs:
                 else
                   how="differs from the deposited file"
                 fi
-                printf '%s\t%s\t%s\n' "$p" "$how" "$(wc -c < "$p" | tr -d ' ')" >> "$rc/${nn}_files.tsv"
+                printf '%s\t%s\t%s\n' "$p" "$how" "$(wc -c < "./$p" | tr -d ' ')" >> "$rc/${nn}_files.tsv"
                 if [[ "$p" =~ [.]([Pp][Nn][Gg]|[Jj][Pp][Ee]?[Gg]|[Gg][Ii][Ff]|[Ss][Vv][Gg]|[Cc][Ss][Vv]|[Tt][Ss][Vv])$ ]]; then
-                  mkdir -p "$rc/${nn}_files/$(dirname "$p")"
-                  cp "$p" "$rc/${nn}_files/$p"
+                  mkdir -p "$rc/${nn}_files/$(dirname "./$p")"
+                  cp "./$p" "$rc/${nn}_files/$p"
                 fi
               done
           done
@@ -329,7 +347,7 @@ jobs:
           if [[ -z "$failed" ]]; then
             echo "every script ran to the end without error" > "$rc/result.txt"
           else
-            echo "error in $failed" > "$rc/result.txt"
+            echo "did not run to the end - $failed" > "$rc/result.txt"
           fi
           # R version, platform, and every package installed beyond base R.
           Rscript -e 'print(sessionInfo()); ip <- installed.packages(priority = "NA"); print(ip[, c("Package", "Version")], quote = FALSE, row.names = FALSE)' > "$rc/session_info.txt" 2>&1
@@ -344,19 +362,22 @@ jobs:
       # report/_not_rewritten.md; the session information, once, to
       # report/_session_info.md.
       - name: Render the report
+        if: always()
         shell: bash
         run: |
           /rocker_scripts/install_quarto.sh
           rc=run/_reprocheck
           # A text file as a code block: the fence is longer than any run of
-          # backticks inside the file, and Quarto shortcodes ({{< >}}) in it
-          # are escaped, so that it is shown exactly as written.
+          # backticks inside the file, and an invisible zero-width space is
+          # put between the two braces and the < of every {{<, so that Quarto
+          # does not take the text for a shortcode and it is shown as written.
+          no_shortcodes() { perl -pe 's/\{\{</{{\xe2\x80\x8b</g'; }
           as_code() {
             local longest fence
             longest=$({ grep -o '`*' "$1" || true; } | awk '{ if (length($0) > n) n = length($0) } END { print n + 0 }')
             fence=$(printf '%*s' $(( longest < 3 ? 3 : longest + 1 )) '' | tr ' ' '`')
             echo "$fence"
-            sed 's/{{</{{{</g; s/>}}/>}}}/g' "$1"
+            no_shortcodes < "$1"
             echo "$fence"
           }
           as_code "$rc/session_info.txt" > report/_session_info.md
@@ -370,7 +391,9 @@ jobs:
               echo
               status=$(cat "$rc/${nn}_exit_status.txt")
               if [[ "$status" == 124 ]]; then
-                echo "Exit status: 124. The script was stopped after running for 60 minutes."
+                echo "Exit status: 124. The script was stopped at the time limit (60 minutes for a script, five hours for all)."
+              elif [[ "$status" == "not run" ]]; then
+                echo "Not run: the five hours for all the scripts were used up before it could start."
               else
                 echo "Exit status: $status (0 means the script ran to the end without error)."
               fi
@@ -399,9 +422,11 @@ jobs:
                   echo "![Drawn on screen]($(basename "$p")){width=80%}"
                   echo
                 done
+                k=0
                 while IFS= read -r p; do
                   [[ -n "$p" ]] || continue
-                  copy="${nn}_saved_$(echo "$p" | tr '/ ' '__')"
+                  k=$((k + 1))
+                  copy="${nn}_saved_${k}.${p##*.}"
                   if cp "$rc/${nn}_files/$p" "report/$copy" 2> /dev/null; then
                     echo "![\`$p\`]($copy){width=80%}"
                   else
@@ -413,7 +438,7 @@ jobs:
               # Figures in formats a web page cannot show; they are in the artifact.
               others=$(cut -f1 "$files" | grep -i -E '[.](pdf|tiff?|eps|ps|bmp)$' || true)
               if [[ -n "$others" ]]; then
-                echo "Figures in PDF, TIFF, EPS or BMP format are not shown here; they are in the artifact, under \`run/\`:"
+                echo "Figures in PDF, TIFF, EPS or BMP format are not shown here; they are in the artifact, under \`run/\`, as the last script left them:"
                 echo
                 while IFS= read -r p; do echo "- \`$p\`"; done <<< "$others"
                 echo
@@ -426,7 +451,7 @@ jobs:
                 while IFS= read -r p; do
                   echo "\`$p\`"
                   echo
-                  Rscript report/table_preview.R "$rc/${nn}_files/$p" | sed 's/{{</{{{</g; s/>}}/>}}}/g'
+                  Rscript report/table_preview.R "$rc/${nn}_files/$p" | no_shortcodes
                   echo
                 done <<< "$tables"
               fi

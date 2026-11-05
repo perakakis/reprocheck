@@ -26,7 +26,8 @@ were deposited, and produces a report that a checker compares with the article.
    its own R session, in the order listed, so that scripts pass results to
    one another only through the files they write. A deposited `.Rprofile` is
    loaded after the check's own settings, unless it activates renv. A script
-   still running after 60 minutes is stopped.
+   still running after 60 minutes is stopped, and all the scripts together
+   have five hours.
 4. **Report.** The workflow renders `report/report.qmd` into an HTML report
    with one section per script. Each section gives the script's exit status,
    the files it wrote (each compared with the file of the same name in the
