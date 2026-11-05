@@ -451,19 +451,6 @@ jobs:
                                     s$n_tests, s$n_found, s$n_full, s$n_partial)
             writeLines(summary_line, "comparison/summary.txt")
             cat(summary_line, "\n")
-
-            # Test only, while Solana is the example: the same PDF converted by the
-            # full GROBID 0.9.0 image must give the same reported tests.
-            ref <- "paper/reference_grobid_full.xml"
-            if (file.exists(ref)) {
-              tests_crf  <- extract_tests(paper)
-              tests_full <- extract_tests(read(ref))
-              check <- sprintf("Reported tests found: %d with the light GROBID image, %d with the full one.",
-                               NROW(tests_crf), NROW(tests_full))
-              writeLines(check, "comparison/conversion_check.txt")
-              cat(check, "\n")
-              stopifnot(NROW(tests_crf) == NROW(tests_full))
-            }
           '
 
       - uses: actions/upload-artifact@v4
